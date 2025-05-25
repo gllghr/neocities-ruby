@@ -23,4 +23,7 @@ Gem::Specification.new do |spec|
   spec.add_dependency 'httpclient-fixcerts', '~> 2.8',  '>= 2.8.5'
   spec.add_dependency 'rake',                '~> 12.3', '>= 12.3.1'
   spec.add_dependency 'whirly',              '~> 0.3',  '>= 0.3.0'
+
+  spec.add_development_dependency 'minitest', '~> 5.25'
+  spec.add_development_dependency 'irb', '~> 1.15' # Implicitly required by minitest
 end

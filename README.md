@@ -12,6 +12,8 @@ If you're using OSX (or already have ruby installed):
 
 ### Ubuntu/Debian
 
+Install ruby using `apt-get`, then you can install the gem with the above command.
+
     sudo apt-get install ruby
 
 ### Windows
@@ -25,3 +27,18 @@ After that, you are all set! Run `neocities` in a command line to see the option
 ## Neocities::Client
 
 This gem also ships with Neocities::Client, which you can use to write code that interfaces with the Neocities API.
+
+## Development
+
+Install the necessary dependencies:
+```
+bundle install
+```
+Execute the CLI:
+```
+bundle exec ruby -I. bin/neocities
+```
+Run the tests:
+```
+bundle exec rake test
+```
