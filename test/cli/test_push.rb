@@ -15,8 +15,10 @@ class CLITest < Minitest::Test
     FileUtils.rm_rf(@temp_dir) if @temp_dir && Dir.exist?(@temp_dir)
   end
 
-  def setup_test_files
-    Dir.chdir(@temp_dir) do
+  def setup_test_files(dir = nil)
+    dir = @temp_dir unless dir
+
+    Dir.chdir(dir) do
       File.write('file1.txt', 'content 1')
       File.write('file2.txt', 'content 2')
 
@@ -36,27 +38,31 @@ class CLITest < Minitest::Test
     end
   end
 
-  def setup_git_repo
-    Dir.chdir(@temp_dir) do
-      # A git repo like you would get from 'git --init', with no object or commits
-      Dir.mkdir('.git')
-      Dir.mkdir('.git/objects')
-      Dir.mkdir('.git/objects/info')
-      Dir.mkdir('.git/objects/pack')
-      Dir.mkdir('.git/refs')
-      Dir.mkdir('.git/refs/heads')
-      Dir.mkdir('.git/refs/tags')
-      Dir.mkdir('.git/info')
+  def setup_git_repo(dir = nil)
+    unless dir
+      dir = File.join(@temp_dir, '.git')
+      Dir.mkdir(dir)
+    end
 
-      File.write('.git/HEAD', "ref: refs/heads/master\n")
-      File.write('.git/config', <<~CONFIG)
+    Dir.chdir(dir) do
+      # A git repo like you would get from 'git --init', with no object or commits
+      Dir.mkdir('objects')
+      Dir.mkdir('objects/info')
+      Dir.mkdir('objects/pack')
+      Dir.mkdir('refs')
+      Dir.mkdir('refs/heads')
+      Dir.mkdir('refs/tags')
+      Dir.mkdir('info')
+
+      File.write('HEAD', "ref: refs/heads/master\n")
+      File.write('config', <<~CONFIG)
         [core]
         	repositoryformatversion = 0
         	filemode = true
         	bare = false
         	logallrefupdates = true
       CONFIG
-      File.write('.git/description', "Unnamed repository; edit this file 'description' to name the repository.\n")
+      File.write('description', "Unnamed repository; edit this file 'description' to name the repository.\n")
     end
   end
 
@@ -155,6 +161,79 @@ class CLITest < Minitest::Test
     assert_uploaded('.hidden_dir/.hidden_file')
   end
 
+  def test_push_exclude_directory
+    setup_test_files
+
+    cli = Neocities::CLI.new(['push', '-e', 'dir_a', @temp_dir])
+
+    cli.instance_variable_set(:@client, @mock_client)
+
+    _out, err = capture_io { cli.push }
+    assert_empty err
+
+    assert_equal 4, @mock_client.uploaded_files.size
+    assert_uploaded('file1.txt')
+    assert_uploaded('file2.txt')
+    assert_uploaded('.hidden_file')
+    assert_uploaded('.hidden_dir/.hidden_file')
+  end
+
+  def test_push_exclude_directory_trailing_slash
+    setup_test_files
+
+    cli = Neocities::CLI.new(['push', '-e', 'dir_a/', @temp_dir])
+
+    cli.instance_variable_set(:@client, @mock_client)
+
+    _out, err = capture_io { cli.push }
+    assert_empty err
+
+    assert_equal 4, @mock_client.uploaded_files.size
+    assert_uploaded('file1.txt')
+    assert_uploaded('file2.txt')
+    assert_uploaded('.hidden_file')
+    assert_uploaded('.hidden_dir/.hidden_file')
+  end
+
+  def test_push_exclude_directory_leading_dot_slash
+    setup_test_files
+
+    cli = Neocities::CLI.new(['push', '-e', './dir_a', @temp_dir])
+
+    cli.instance_variable_set(:@client, @mock_client)
+
+    _out, err = capture_io { cli.push }
+    assert_empty err
+
+    assert_equal 4, @mock_client.uploaded_files.size
+    assert_uploaded('file1.txt')
+    assert_uploaded('file2.txt')
+    assert_uploaded('.hidden_file')
+    assert_uploaded('.hidden_dir/.hidden_file')
+  end
+
+  def test_push_gitignores
+    setup_test_files
+    setup_git_repo
+    setup_gitignore('.', ['*2.txt', '!sub*2.txt'])
+    setup_gitignore('dir_a', ['*1.txt'])
+
+    cli = Neocities::CLI.new(['push', @temp_dir])
+
+    cli.instance_variable_set(:@client, @mock_client)
+
+    _out, err = capture_io { cli.push }
+    assert_empty err
+
+    assert_equal 6, @mock_client.uploaded_files.size
+    assert_uploaded('.gitignore')
+    assert_uploaded('file1.txt')
+    assert_uploaded('dir_a/.gitignore')
+    assert_uploaded('dir_a/dir_b/sub_file_2.txt')
+    assert_uploaded('.hidden_file')
+    assert_uploaded('.hidden_dir/.hidden_file')
+  end
+
   def test_push_nogitignore
     setup_test_files
     setup_git_repo
@@ -178,6 +257,33 @@ class CLITest < Minitest::Test
     assert_uploaded('dir_a/dir_b/sub_file_2.txt')
     assert_uploaded('.hidden_file')
     assert_uploaded('.hidden_dir/.hidden_file')
+  end
+
+  def test_push_gitfile_pointing_to_gitdir
+    git_dir = File.join(@temp_dir, "git")
+    Dir.mkdir(git_dir)
+    working_dir = File.join(@temp_dir, "working")
+    Dir.mkdir(working_dir)
+    File.write(File.join(working_dir, ".git"), "gitdir: #{git_dir}")
+    setup_test_files(working_dir)
+    setup_git_repo(git_dir)
+    setup_gitignore('working', ['*2.txt', '!sub*2.txt'])
+    setup_gitignore('working/dir_a', ['*1.txt'])
+
+    cli = Neocities::CLI.new(['push', working_dir])
+
+    cli.instance_variable_set(:@client, @mock_client)
+
+    _out, err = capture_io { cli.push }
+    assert_empty err
+
+    assert_equal 6, @mock_client.uploaded_files.size
+    assert_uploaded('working/.gitignore', '.gitignore')
+    assert_uploaded('working/file1.txt', 'file1.txt')
+    assert_uploaded('working/dir_a/.gitignore', 'dir_a/.gitignore')
+    assert_uploaded('working/dir_a/dir_b/sub_file_2.txt', 'dir_a/dir_b/sub_file_2.txt')
+    assert_uploaded('working/.hidden_file', '.hidden_file')
+    assert_uploaded('working/.hidden_dir/.hidden_file', '.hidden_dir/.hidden_file')
   end
 
   def test_push_dry_run
@@ -217,6 +323,53 @@ class CLITest < Minitest::Test
     assert_includes @mock_client.deleted_files, 'dir_a/to_remove2'
   end
 
+  def test_push_prune_with_excludes
+    setup_test_files
+    @mock_client.preexisting_files = ['to_remove1', 'dir_a/sub_file_1.txt']
+
+    cli = Neocities::CLI.new(['push', '-e', 'dir_a', '--prune', @temp_dir])
+
+    cli.instance_variable_set(:@client, @mock_client)
+
+    _out, err = capture_io { cli.push }
+    assert_empty err
+
+    assert_equal 4, @mock_client.uploaded_files.size
+    assert_uploaded('file1.txt')
+    assert_uploaded('file2.txt')
+    assert_uploaded('.hidden_file')
+    assert_uploaded('.hidden_dir/.hidden_file')
+
+    assert_equal 2, @mock_client.deleted_files.size
+    assert_includes @mock_client.deleted_files, 'to_remove1'
+    # Excluded file should get pruned
+    assert_includes @mock_client.deleted_files, 'dir_a/sub_file_1.txt'
+  end
+
+  def test_push_prune_with_gitignores
+    setup_test_files
+    setup_git_repo
+    setup_gitignore('.', ['*.txt'])
+    @mock_client.preexisting_files = ['to_remove1', 'dir_a/sub_file_1.txt']
+
+    cli = Neocities::CLI.new(['push', '--prune', @temp_dir])
+
+    cli.instance_variable_set(:@client, @mock_client)
+
+    _out, err = capture_io { cli.push }
+    assert_empty err
+
+    assert_equal 3, @mock_client.uploaded_files.size
+    assert_uploaded('.gitignore')
+    assert_uploaded('.hidden_file')
+    assert_uploaded('.hidden_dir/.hidden_file')
+
+    assert_equal 2, @mock_client.deleted_files.size
+    assert_includes @mock_client.deleted_files, 'to_remove1'
+    # Ignored file should get pruned
+    assert_includes @mock_client.deleted_files, 'dir_a/sub_file_1.txt'
+  end
+
   def test_push_exclude_nonexistent
     # We shouldn't get any errors if we pass a non-existent file/dir as an
     # exclude. It should just be ignored.
@@ -236,6 +389,32 @@ class CLITest < Minitest::Test
     assert_uploaded('dir_a/dir_b/sub_file_2.txt')
     assert_uploaded('.hidden_file')
     assert_uploaded('.hidden_dir/.hidden_file')
+  end
+
+  def test_path_excluded
+    cli = Neocities::CLI.new([])
+
+    excluded_paths = ['./foo/', 'bar', 'a/b/c']
+    cli.instance_variable_set(:@excluded_paths, excluded_paths)
+
+    assert cli.path_excluded?('./foo')
+    assert cli.path_excluded?('foo/')
+    assert cli.path_excluded?('foo/bar')
+    assert cli.path_excluded?('foo/bar/baz')
+    assert cli.path_excluded?('bar')
+    assert cli.path_excluded?('./bar')
+    assert cli.path_excluded?('bar/')
+    assert cli.path_excluded?('bar/baz/qux')
+    assert cli.path_excluded?('a/b/c')
+    assert cli.path_excluded?('a/b/c/d')
+
+    refute cli.path_excluded?('a')
+    refute cli.path_excluded?('fo')
+    refute cli.path_excluded?('foobar')
+    refute cli.path_excluded?('food/bar')
+    refute cli.path_excluded?('./food')
+    refute cli.path_excluded?('a/d')
+    refute cli.path_excluded?('a/b/d')
   end
 
   class MockClient

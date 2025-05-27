@@ -5,6 +5,8 @@ require 'tty/prompt'
 require 'fileutils'
 require 'json' # for reading configs
 require 'whirly' # for loader spinner
+require 'set'
+require 'open3'
 
 require File.join(File.dirname(__FILE__), 'client')
 
@@ -183,16 +185,78 @@ module Neocities
       end
     end
 
+    def find_git_repo_root(start_path)
+      current_path = Pathname.new(start_path).expand_path
+
+      loop do
+        git_path = current_path + '.git'
+
+        begin
+          if git_path.exist? && valid_git_repo?(git_path)
+            return current_path
+          end
+        rescue Errno::EACCES, Errno::EPERM, IOError
+          # Permission or read error, treat as not a repo and continue
+        end
+
+        parent = current_path.parent
+        break if parent == current_path # reached filesystem root
+        current_path = parent
+      end
+
+      nil
+    end
+
+    def valid_git_repo?(git_path)
+      if git_path.directory?
+        # Standard .git directory
+        return git_path.join('HEAD').exist? &&
+               git_path.join('objects').directory? &&
+               git_path.join('refs').directory?
+      elsif git_path.file?
+        # .git file pointing to gitdir
+        content = git_path.read.strip
+        return content.start_with?('gitdir: ')
+      end
+
+      false
+    end
+
+    def path_ignored?(path)
+      cmd = ['git', 'check-ignore', '--quiet', '--', path]
+      begin
+        output, status = Open3.capture2e(*cmd)
+        # Exit code 0 means ignored, 1 means not ignored, 128 means error
+        case status.exitstatus
+        when 0
+          return true
+        when 1
+          return false
+        else
+          display_response result: 'error', message: <<~MSG
+            Unexpected exit status #{status.exitstatus} when running '#{cmd.join(' ')}'
+            Output of failing command:
+            #{output}
+            MSG
+          exit
+        end
+      rescue Errno::ENOENT
+        display_response result: 'error', message: "Git repository detected but git executable not" \
+          " found. Please install git to use .gitignore support, or use --no-gitignore to disable."
+        exit
+      end
+    end
+
     def push
       display_push_help_and_exit if @subargs.empty?
       @no_gitignore = false
-      @excluded_files = []
+      @excluded_paths = []
       @dry_run = false
       @prune = false
       loop do
         case @subargs[0]
         when '--no-gitignore' then @subargs.shift; @no_gitignore = true
-        when '-e' then @subargs.shift; @excluded_files.push(@subargs.shift)
+        when '-e' then @subargs.shift; @excluded_paths.push(Pathname @subargs.shift)
         when '--dry-run' then @subargs.shift; @dry_run = true
         when '--prune' then @subargs.shift; @prune = true
         when /^-/ then puts(@pastel.red.bold("Unknown option: #{@subargs[0].inspect}")); display_push_help_and_exit
@@ -221,17 +285,40 @@ module Neocities
         puts @pastel.green.bold("Doing a dry run, not actually pushing anything")
       end
 
-      if @prune
-        pruned_dirs = []
-        resp = @client.list
-        resp[:files].each do |file|
-          path = Pathname(File.join(@subargs[0], file[:path]))
+      if @no_gitignore
+        git_repo_root = nil
+      else
+        git_repo_root = find_git_repo_root(root_path)
+        if git_repo_root
+          puts "Not pushing .gitignore entries (--no-gitignore to disable)"
 
-          pruned_dirs << path if !path.exist? && (file[:is_directory])
+          if File.identical?(git_repo_root, root_path)
+            # The .git/ directory should be implicitly ignored, as it is by git porcelain
+            # commands like git status but isn't by git check-ignore, which we use to
+            # process .gitignore files.
+            @excluded_paths << Pathname.new('.git')
+          end
+        end
+      end
 
-          if !path.exist? && !pruned_dirs.include?(path.dirname)
-            print @pastel.bold("Deleting #{file[:path]} ... ")
-            resp = @client.delete_wrapper_with_dry_run file[:path], @dry_run
+      Dir.chdir(root_path) do
+        files_to_push = Dir.glob(File.join('**', '*'), File::FNM_DOTMATCH)
+        files_to_push.select! { |path| File.file?(path) } # Only push regular files
+        unless @no_gitignore || git_repo_root.nil?
+          files_to_push.reject! { |path| path_ignored?(path) }
+        end
+        files_to_push.reject! { |path| path_excluded?(path) }
+        files_to_push = files_to_push.map { |path| Pathname(path).cleanpath }.to_set
+
+        if @prune
+          resp = @client.list
+          files_on_site = resp[:files].map { |file| file[:path] }
+          files_to_delete = files_on_site.select do |path|
+            !files_to_push.member? Pathname(path).cleanpath
+          end
+          files_to_delete.each do |path|
+            print @pastel.bold("Deleting #{path} ... ")
+            resp = @client.delete_wrapper_with_dry_run path, @dry_run
 
             if resp[:result] == 'success'
               print @pastel.green.bold("SUCCESS") + "\n"
@@ -241,39 +328,8 @@ module Neocities
             end
           end
         end
-      end
 
-      Dir.chdir(root_path) do
-        paths = Dir.glob(File.join('**', '*'), File::FNM_DOTMATCH)
-
-        if @no_gitignore == false
-          begin
-            ignores = File.readlines('.gitignore').collect! do |ignore|
-              ignore.strip!
-              File.directory?(ignore) ? "#{ignore}**" : ignore
-            end
-            paths.select! do |path|
-              res = true
-              ignores.each do |ignore|
-                if File.fnmatch?(ignore.strip, path)
-                  res = false
-                  break
-                end
-              end
-            end
-            puts "Not pushing .gitignore entries (--no-gitignore to disable)"
-          rescue Errno::ENOENT
-          end
-        end
-
-        paths.select! { |p| !@excluded_files.include?(p) }
-
-        paths.select! { |p| !@excluded_files.include?(Pathname.new(p).dirname.to_s) }
-
-        paths.collect! { |path| Pathname path }
-
-        paths.each do |path|
-          next if path.directory?
+        files_to_push.each do |path|
           print @pastel.bold("Uploading #{path} ... ")
           resp = @client.upload path, path, @dry_run
 
@@ -286,6 +342,17 @@ module Neocities
             display_response resp
           end
         end
+      end
+    end
+
+    # Returns true if any of the excluded paths are equal to or a parent of the given
+    # path
+    def path_excluded?(path)
+      normalized_path = Pathname.new(path).cleanpath
+
+      @excluded_paths.any? do |excluded|
+        excluded_path = Pathname.new(excluded).cleanpath
+        normalized_path == excluded_path || normalized_path.to_s.start_with?(excluded_path.to_s + '/')
       end
     end
 
