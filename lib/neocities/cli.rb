@@ -5,6 +5,8 @@ require 'tty/prompt'
 require 'fileutils'
 require 'json' # for reading configs
 require 'whirly' # for loader spinner
+require 'rugged' # for checking gitignores
+require 'set'
 
 require File.join(File.dirname(__FILE__), 'client')
 
@@ -186,13 +188,13 @@ module Neocities
     def push
       display_push_help_and_exit if @subargs.empty?
       @no_gitignore = false
-      @excluded_files = []
+      @excluded_paths = []
       @dry_run = false
       @prune = false
       loop do
         case @subargs[0]
         when '--no-gitignore' then @subargs.shift; @no_gitignore = true
-        when '-e' then @subargs.shift; @excluded_files.push(@subargs.shift)
+        when '-e' then @subargs.shift; @excluded_paths.push(Pathname @subargs.shift)
         when '--dry-run' then @subargs.shift; @dry_run = true
         when '--prune' then @subargs.shift; @prune = true
         when /^-/ then puts(@pastel.red.bold("Unknown option: #{@subargs[0].inspect}")); display_push_help_and_exit
@@ -221,17 +223,35 @@ module Neocities
         puts @pastel.green.bold("Doing a dry run, not actually pushing anything")
       end
 
-      if @prune
-        pruned_dirs = []
-        resp = @client.list
-        resp[:files].each do |file|
-          path = Pathname(File.join(@subargs[0], file[:path]))
+      if @no_gitignore
+        git_repo = nil
+      else
+        begin
+          git_repo = Rugged::Repository.discover(root_path)
+          puts "Not pushing .gitignore entries (--no-gitignore to disable)"
+        rescue Rugged::RepositoryError
+          git_repo = nil
+        end
+      end
 
-          pruned_dirs << path if !path.exist? && (file[:is_directory])
+      Dir.chdir(root_path) do
+        files_to_push = Dir.glob(File.join('**', '*'), File::FNM_DOTMATCH)
+        files_to_push.select! { |path| File.file?(path) } # Only push regular files
+        unless @no_gitignore || git_repo.nil?
+          files_to_push.reject! { |path| git_repo.path_ignored?(path) }
+        end
+        files_to_push.reject! { |path| path_excluded?(path) }
+        files_to_push = files_to_push.map { |path| Pathname(path).cleanpath }.to_set
 
-          if !path.exist? && !pruned_dirs.include?(path.dirname)
-            print @pastel.bold("Deleting #{file[:path]} ... ")
-            resp = @client.delete_wrapper_with_dry_run file[:path], @dry_run
+        if @prune
+          resp = @client.list
+          files_on_site = resp[:files].map { |file| file[:path] }
+          files_to_delete = files_on_site.select do |path|
+            !files_to_push.member? Pathname(path).cleanpath
+          end
+          files_to_delete.each do |path|
+            print @pastel.bold("Deleting #{path} ... ")
+            resp = @client.delete_wrapper_with_dry_run path, @dry_run
 
             if resp[:result] == 'success'
               print @pastel.green.bold("SUCCESS") + "\n"
@@ -241,39 +261,8 @@ module Neocities
             end
           end
         end
-      end
 
-      Dir.chdir(root_path) do
-        paths = Dir.glob(File.join('**', '*'), File::FNM_DOTMATCH)
-
-        if @no_gitignore == false
-          begin
-            ignores = File.readlines('.gitignore').collect! do |ignore|
-              ignore.strip!
-              File.directory?(ignore) ? "#{ignore}**" : ignore
-            end
-            paths.select! do |path|
-              res = true
-              ignores.each do |ignore|
-                if File.fnmatch?(ignore.strip, path)
-                  res = false
-                  break
-                end
-              end
-            end
-            puts "Not pushing .gitignore entries (--no-gitignore to disable)"
-          rescue Errno::ENOENT
-          end
-        end
-
-        paths.select! { |p| !@excluded_files.include?(p) }
-
-        paths.select! { |p| !@excluded_files.include?(Pathname.new(p).dirname.to_s) }
-
-        paths.collect! { |path| Pathname path }
-
-        paths.each do |path|
-          next if path.directory?
+        files_to_push.each do |path|
           print @pastel.bold("Uploading #{path} ... ")
           resp = @client.upload path, path, @dry_run
 
@@ -286,6 +275,17 @@ module Neocities
             display_response resp
           end
         end
+      end
+    end
+
+    # Returns true if any of the excluded paths are equal to or a parent of the given
+    # path
+    def path_excluded?(path)
+      normalized_path = Pathname.new(path).cleanpath
+
+      @excluded_paths.any? do |excluded|
+        excluded_path = Pathname.new(excluded).cleanpath
+        normalized_path == excluded_path || normalized_path.to_s.start_with?(excluded_path.to_s + '/')
       end
     end
 
